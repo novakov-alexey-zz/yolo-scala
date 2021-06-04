@@ -13,8 +13,10 @@ import org.bytedeco.opencv.global.opencv_imgproc.*
 import ai.onnxruntime.{OrtEnvironment, OrtSession}
 import ai.onnxruntime.OnnxTensor
 
-import scala.jdk.CollectionConverters._
+import scala.jdk.CollectionConverters.*
 import scala.util.Using
+import scala.reflect.ClassTag
+
 import java.nio.file.{Files, Paths, Path}
 import java.nio.FloatBuffer
 
@@ -32,10 +34,12 @@ val ModelPath = Paths.get("models", "yolov3.onnx")
 val env = OrtEnvironment.getEnvironment()
 val session = env.createSession(ModelPath.toString, OrtSession.SessionOptions())
 
-enum YoloGrid(val name: String, val size: Int):
-  case Small   extends YoloGrid("conv_105", 52)
-  case Medium  extends YoloGrid("conv_93", 26)
-  case Large   extends YoloGrid("conv_81", 13)  
+enum YoloGrid(val name: String, val size: Int, val anchors: Array[Int]):
+  case Small   extends YoloGrid("conv_105", 52, Array(10, 13, 16, 30, 33, 23))
+  case Medium  extends YoloGrid("conv_93", 26, Array(30, 61, 62, 45, 59, 119))
+  case Large   extends YoloGrid("conv_81", 13, Array(116, 90, 156, 198, 373, 326))
+
+case class BoundBox(xmin: Float, ymin: Float, xmax: Float, ymax: Float, objectness: Float, classes: Array[Float])
 
 def shape(batch: Int) =
   batch #: ImageHeight #: ImageWidth #: Channels #: SNil
@@ -53,17 +57,18 @@ def predict(images: Array[Float], model: ORTModelBackend, batch: Dimension = 1) 
     batch.type #: GridSize.type #: GridSize.type #: BoundingBoxesDim.type #: SNil
   ](Tuple(input))
 
+def toYoloGrid(key: String) = 
+  if key == YoloGrid.Small.name then YoloGrid.Small
+  else if key == YoloGrid.Medium.name then YoloGrid.Medium
+  else YoloGrid.Large
+
 def predict(images: Array[Float], batch: Long): Map[YoloGrid, Array[Float]] =     
   var tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(images), Array(batch, ImageHeight, ImageWidth, Channels))
   val inputs = Map("input_1:0" -> tensor).asJava
   Using.resource(session.run(inputs)) { result =>
     result.iterator().asScala.toList
-      .map{ r => 
-        val key =
-          if r.getKey == YoloGrid.Small.name then YoloGrid.Small
-          else if r.getKey == YoloGrid.Medium.name then YoloGrid.Medium
-          else YoloGrid.Large
-
+      .map{ r =>
+        val key = toYoloGrid(r.getKey)
         key -> r.getValue.asInstanceOf[OnnxTensor].getFloatBuffer.array()
       }
       .toMap
@@ -97,15 +102,99 @@ def toArray(mat: Mat): Array[Float] =
 
   result
 
+def sigmoid(x: Float): Float = 
+  1 / (1 + math.exp(-x)).toFloat
+
+def getBoxes(
+  prediction: Array[Array[Array[Array[Float]]]], 
+  anchors: Array[Int], 
+  gridSize: Int, 
+  imageWidth: Int, 
+  imageHeight: Int
+): Array[BoundBox] = 
+  val threshold = 0.6
+  val boxes = for 
+    (gridRow, row) <- prediction.zipWithIndex
+    (boxes, col) <- gridRow.zipWithIndex
+    (box, boxId) <- boxes.zipWithIndex 
+  yield
+    val objectness = sigmoid(box(4))
+    if objectness > threshold then
+      val (x, y, w, h) =  (sigmoid(box(0)), sigmoid(box(1)), box(2), box(3))
+      val centerX = (row + x) / gridSize
+      val centerY = (col + y) / gridSize
+      val imageWidth = anchors(2 * boxId + 0) * math.exp(w).toFloat / gridSize
+      val imageHeight = anchors(2 * boxId + 1) * math.exp(h).toFloat / gridSize
+      val classes = box.slice(5, box.length).map(sigmoid)
+      val xmin = centerX - imageWidth / 2 / imageWidth
+      val xmax = centerX + imageWidth / 2 / imageWidth
+      val ymin = centerY - imageHeight / 2 / imageHeight
+      val ymax = centerY + imageHeight / 2 / imageHeight
+      Some(BoundBox(xmin, ymin, xmax, ymax, objectness, classes))
+    else None
+  boxes.flatten
+
+extension [T: ClassTag: Numeric](a: Array[T])(using o: Ordering[T])
+  def argsort: Array[Int] =
+    a.zipWithIndex.sortBy(_._1).map(_._2).toArray
+
+def intervalOverlap(intervalA: (Float, Float), intervalB: (Float, Float)) =
+  val (x1, x2) = intervalA
+  val (x3, x4) = intervalB
+  if x3 < x1 then 
+    if x4 < x1 then 0
+    else math.min(x2, x4) - x1
+  else
+    if x2 < x3 then 0
+    else math.min(x2, x4) - x3
+
+def bboxIou(b1: BoundBox, b2: BoundBox): Float =
+  val intersect_w = intervalOverlap((b1.xmin, b1.xmax), (b2.xmin, b2.xmax))
+  val intersect_h = intervalOverlap((b1.ymin, b1.ymax), (b2.ymin, b2.ymax))
+  val intersect = intersect_w * intersect_h
+  val (w1, h1) = (b1.xmax - b1.xmin, b1.ymax - b1.ymin)
+  val (w2, h2) = (b2.xmax - b2.xmin, b2.ymax - b2.ymin)
+  val union = w1 * h1 + w2 * h2 - intersect
+  intersect / union
+
+def nonMaximalSupression(boxes: Array[BoundBox], classCount: Int, nmsThresh: Float = 0.5): Unit =  
+  for c <- (0 to classCount) do
+    val sortedIndices = boxes.map(- _.classes(c)).argsort
+
+    for i <- (0 to sortedIndices.length) do
+      val indexI = sortedIndices(i)
+
+      if boxes(indexI).classes(c) != 0 then
+        for j <- (i + 1 to sortedIndices.length) do
+          val indexJ = sortedIndices(j)
+          
+          if bboxIou(boxes(indexI), boxes(indexJ)) >= nmsThresh then 
+            boxes(indexJ).classes(c) = 0
+
+def gridPredictions(grid: YoloGrid, outputs: Map[YoloGrid, Array[Float]]) =
+  outputs(grid)
+    .grouped(BoundingBoxes).toArray
+    .grouped(Anchors).toArray
+    .grouped(grid.size).toArray
+
+
 @main 
 def main = 
   val file = Paths.get("zebra.jpg")  
   val image = imread(file.toString)
+  val (imageWidth, imageHeight) = (image.size.width, image.size.height)
   val input = toModelInput(image)  
   val model = getModel()
   val outputs = predict(input, 1)
   
-  val smallGrid = outputs(YoloGrid.Small)
-    .grouped(BoundingBoxes).toArray
-    .grouped(Anchors).toArray
-    .grouped(YoloGrid.Small.size).toArray  
+  val classCount = BoundingBoxes - 5
+
+  val boxes = YoloGrid.values.map { yg =>
+    val predictions = gridPredictions(yg, outputs)    
+    getBoxes(predictions, yg.anchors, yg.size, imageWidth, imageHeight)
+  }.flatten
+
+  nonMaximalSupression(boxes, classCount)
+
+
+  
