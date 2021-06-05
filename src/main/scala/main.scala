@@ -1,13 +1,8 @@
-import io.kjaer.compiletime.*
-import org.emergentorder.compiletime.*
-import org.emergentorder.onnx.Tensors.*
-import org.emergentorder.onnx.backends.*
-
 import org.bytedeco.opencv.global.opencv_imgcodecs.{imread, imwrite}
 import org.bytedeco.opencv.global.opencv_imgproc.resize
-import org.bytedeco.opencv.opencv_core.{Mat, Size, Scalar}
+import org.bytedeco.opencv.opencv_core.{Mat, Size, Scalar, Point}
 import org.bytedeco.javacpp.indexer.FloatRawIndexer
-import org.bytedeco.opencv.global.opencv_core.{divide, CV_32FC4}
+import org.bytedeco.opencv.global.opencv_core.{divide, CV_32FC3}
 import org.bytedeco.opencv.global.opencv_imgproc.*
 
 import ai.onnxruntime.{OrtEnvironment, OrtSession}
@@ -20,70 +15,32 @@ import scala.reflect.ClassTag
 import java.nio.file.{Files, Paths, Path}
 import java.nio.FloatBuffer
 
-val TensorShapeDenotation = "Batch" ##: "Height" ##: "Width" ##: "Channel" ##: TSNil
-val TensorDenotation: String & Singleton = "Image"
-val ImageWidth = 416
-val ImageHeight = 416
-val Channels = 3
-val GridSize: Dimension = 52
-val BoundingBoxes = 85
-val Anchors = 3
-val BoundingBoxesDim: Dimension = (BoundingBoxes * Anchors).asInstanceOf[Dimension]
-val ModelPath = Paths.get("models", "yolov3.onnx")
+import YoloModel.*
+
+type Tensor4D = Array[Array[Array[Array[Float]]]]
 
 val env = OrtEnvironment.getEnvironment()
-val session = env.createSession(ModelPath.toString, OrtSession.SessionOptions())
-
-enum YoloGrid(val name: String, val size: Int, val anchors: Array[Int]):
-  case Small   extends YoloGrid("conv_105", 52, Array(10, 13, 16, 30, 33, 23))
-  case Medium  extends YoloGrid("conv_93", 26, Array(30, 61, 62, 45, 59, 119))
-  case Large   extends YoloGrid("conv_81", 13, Array(116, 90, 156, 198, 373, 326))
-
-case class BoundBox(xmin: Float, ymin: Float, xmax: Float, ymax: Float, objectness: Float, classes: Array[Float])
-
-def shape(batch: Int) =
-  batch #: ImageHeight #: ImageWidth #: Channels #: SNil
-
-def getModel(path: Path = ModelPath) =
-  val bytes = Files.readAllBytes(path)
-  ORTModelBackend(bytes)
-
-def predict(images: Array[Float], model: ORTModelBackend, batch: Dimension = 1) =
-  val input = Tensor(images, TensorDenotation, TensorShapeDenotation, shape(batch))    
-  model.fullModel[
-    Float, 
-    "ImageClassification", 
-    "Batch" ##: "BoundingBoxes" ##: TSNil, 
-    batch.type #: GridSize.type #: GridSize.type #: BoundingBoxesDim.type #: SNil
-  ](Tuple(input))
-
-def toYoloGrid(key: String) = 
-  if key == YoloGrid.Small.name then YoloGrid.Small
-  else if key == YoloGrid.Medium.name then YoloGrid.Medium
-  else YoloGrid.Large
+val session = env.createSession(OnnxModelPath.toString, OrtSession.SessionOptions())
 
 def predict(images: Array[Float], batch: Long): Map[YoloGrid, Array[Float]] =     
-  var tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(images), Array(batch, ImageHeight, ImageWidth, Channels))
+  val shape = Array(batch, NetHeight, NetWidth, Channels)  
+  var tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(images), shape)
   val inputs = Map("input_1:0" -> tensor).asJava
-  Using.resource(session.run(inputs)) { result =>
-    result.iterator().asScala.toList
-      .map{ r =>
-        val key = toYoloGrid(r.getKey)
-        key -> r.getValue.asInstanceOf[OnnxTensor].getFloatBuffer.array()
+  Using.resource(session.run(inputs)) { outputs =>    
+    outputs.iterator().asScala.toList
+      .map { out =>
+        val key = toYoloGrid(out.getKey)        
+        val array = out.getValue.asInstanceOf[OnnxTensor].getFloatBuffer.array()        
+        key -> array
       }
       .toMap
   }
 
-// TODO: clone initial image
 def toModelInput(image: Mat): Array[Float] =  
-  resize(image, image, Size(ImageHeight, ImageWidth))
-  toArray(scale(image))
-
-def scale(img: Mat): Mat =
   val out = Mat()
-  img.assignTo(out, CV_32FC4)
-  divide(255d, out, out)
-  out
+  image.assignTo(out, CV_32FC3)
+  resize(out, out, Size(NetHeight, NetWidth))
+  toArray(out).map(_ / 255f)
 
 def toArray(mat: Mat): Array[Float] =
   val w = mat.cols
@@ -106,39 +63,37 @@ def sigmoid(x: Float): Float =
   1 / (1 + math.exp(-x)).toFloat
 
 def getBoxes(
-  prediction: Array[Array[Array[Array[Float]]]], 
+  prediction: Tensor4D, 
   anchors: Array[Int], 
   gridSize: Int, 
   imageWidth: Int, 
-  imageHeight: Int
-): Array[BoundBox] = 
-  val threshold = 0.6
-  val boxes = for 
+  imageHeight: Int,
+  threshold: Float  
+): Array[BoundBox] =   
+  for 
     (gridRow, row) <- prediction.zipWithIndex
     (boxes, col) <- gridRow.zipWithIndex
     (box, boxId) <- boxes.zipWithIndex 
-  yield
-    val objectness = sigmoid(box(4))
-    if objectness > threshold then
-      val (x, y, w, h) =  (sigmoid(box(0)), sigmoid(box(1)), box(2), box(3))
-      val centerX = (row + x) / gridSize
-      val centerY = (col + y) / gridSize
-      val imageWidth = anchors(2 * boxId + 0) * math.exp(w).toFloat / gridSize
-      val imageHeight = anchors(2 * boxId + 1) * math.exp(h).toFloat / gridSize
-      val classes = box.slice(5, box.length).map(sigmoid)
-      val xmin = centerX - imageWidth / 2 / imageWidth
-      val xmax = centerX + imageWidth / 2 / imageWidth
-      val ymin = centerY - imageHeight / 2 / imageHeight
-      val ymax = centerY + imageHeight / 2 / imageHeight
-      Some(BoundBox(xmin, ymin, xmax, ymax, objectness, classes))
-    else None
-  boxes.flatten
+    objectness = sigmoid(box(ObjectnessIndex))
+    if objectness > threshold
+  yield    
+    val (x, y, w, h) =  (sigmoid(box(0)), sigmoid(box(1)), box(2), box(3))
+    val centerX = (col + x) / gridSize
+    val centerY = (row + y) / gridSize
+    val width = anchors(2 * boxId + 0) * math.exp(w).toFloat / NetWidth
+    val height = anchors(2 * boxId + 1) * math.exp(h).toFloat / NetHeight
+    val classes = box.drop(BoxHeader).map(sigmoid)    
+    val xmin = (centerX - width / 2) * imageWidth
+    val ymin = (centerY - height / 2) * imageHeight
+    val xmax = (centerX + width / 2) * imageWidth
+    val ymax = (centerY + height / 2) * imageHeight
+    BoundBox(xmin.toInt, ymin.toInt, xmax.toInt, ymax.toInt, objectness, classes)    
 
 extension [T: ClassTag: Numeric](a: Array[T])(using o: Ordering[T])
   def argsort: Array[Int] =
     a.zipWithIndex.sortBy(_._1).map(_._2).toArray
 
-def intervalOverlap(intervalA: (Float, Float), intervalB: (Float, Float)) =
+def intervalOverlap(intervalA: (Int, Int), intervalB: (Int, Int)) =
   val (x1, x2) = intervalA
   val (x3, x4) = intervalB
   if x3 < x1 then 
@@ -155,17 +110,17 @@ def bboxIou(b1: BoundBox, b2: BoundBox): Float =
   val (w1, h1) = (b1.xmax - b1.xmin, b1.ymax - b1.ymin)
   val (w2, h2) = (b2.xmax - b2.xmin, b2.ymax - b2.ymin)
   val union = w1 * h1 + w2 * h2 - intersect
-  intersect / union
+  intersect.toFloat / union
 
 def nonMaximalSupression(boxes: Array[BoundBox], classCount: Int, nmsThresh: Float = 0.5): Unit =  
-  for c <- (0 to classCount) do
+  for c <- (0 until classCount) do
     val sortedIndices = boxes.map(- _.classes(c)).argsort
 
-    for i <- (0 to sortedIndices.length) do
+    for i <- (0 until sortedIndices.length) do
       val indexI = sortedIndices(i)
 
       if boxes(indexI).classes(c) != 0 then
-        for j <- (i + 1 to sortedIndices.length) do
+        for j <- (i + 1 until sortedIndices.length) do
           val indexJ = sortedIndices(j)
           
           if bboxIou(boxes(indexI), boxes(indexJ)) >= nmsThresh then 
@@ -173,28 +128,61 @@ def nonMaximalSupression(boxes: Array[BoundBox], classCount: Int, nmsThresh: Flo
 
 def gridPredictions(grid: YoloGrid, outputs: Map[YoloGrid, Array[Float]]) =
   outputs(grid)
-    .grouped(BoundingBoxes).toArray
+    .grouped(BoundingBox).toArray
     .grouped(Anchors).toArray
     .grouped(grid.size).toArray
 
+def getPredictedBoxes(boxes: Array[BoundBox], labels: Array[String], thresh: Float) = 
+  boxes.flatMap { box =>
+    for i <- (0 until labels.length) 
+    if box.classes(i) > thresh
+    yield (box, labels(i), box.classes(i) * 100)
+  }
 
+def drawBoxes(frame: Mat, relevantBoxes: Array[(BoundBox, String, Float)]) = 
+  for (box, label, score) <- relevantBoxes do      
+      val (y1, x1, y2, x2) = (box.ymin, box.xmin, box.ymax, box.xmax)
+      val text = f"$label ($score%1.3f)"
+      val thickness = 1
+      val fontScale = 0.5
+      val font = FONT_HERSHEY_SIMPLEX      
+      val rectColor = Scalar(255, 255, 255, 0)      
+      rectangle(
+        frame,
+        Point(x1.toInt, y1.toInt),
+        Point(x2.toInt, y2.toInt),
+        rectColor,
+        thickness,
+        LINE_AA,
+        0
+      )      
+      val fontColor = Scalar(255, 255, 255, 0)
+      putText(frame, text, Point(x1.toInt, y1.toInt), font, fontScale, fontColor, thickness, LINE_AA, false)
 @main 
-def main = 
-  val file = Paths.get("zebra.jpg")  
-  val image = imread(file.toString)
+def main =     
+  val start = System.currentTimeMillis
+  val image = imread("zebra.jpg")
   val (imageWidth, imageHeight) = (image.size.width, image.size.height)
   val input = toModelInput(image)  
-  val model = getModel()
   val outputs = predict(input, 1)
   
-  val classCount = BoundingBoxes - 5
-
-  val boxes = YoloGrid.values.map { yg =>
-    val predictions = gridPredictions(yg, outputs)    
-    getBoxes(predictions, yg.anchors, yg.size, imageWidth, imageHeight)
-  }.flatten
-
-  nonMaximalSupression(boxes, classCount)
-
-
+  // discard all boxes with object probability less than threshold
+  val threshold = 0.6f
   
+  val boxes = YoloGrid.values.flatMap { yg =>
+    val predictions = gridPredictions(yg, outputs)    
+    getBoxes(predictions, yg.anchors, yg.size, imageWidth, imageHeight, threshold)
+  }  
+  println(s"Got ${boxes.length} boxes with objects")
+
+  nonMaximalSupression(boxes, ClassCount)
+  val relevantBoxes = getPredictedBoxes(boxes, labels, threshold)  
+  println(s"Remaining boxes: ${relevantBoxes.length}")  
+  drawBoxes(image, relevantBoxes)
+  imwrite("zebra-out.jpg", image)
+
+  val end = System.currentTimeMillis - start
+  println(s"Total duration: ${end/1000f} secs")
+
+  env.close()
+  session.close()
