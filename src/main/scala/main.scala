@@ -12,7 +12,6 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.reflect.ClassTag
 
-import java.nio.file.{Files, Paths, Path}
 import java.nio.FloatBuffer
 
 import YoloModel.*
@@ -157,7 +156,17 @@ def drawBoxes(frame: Mat, relevantBoxes: Array[(BoundBox, String, Float)]) =
         0
       )      
       val fontColor = Scalar(255, 255, 255, 0)
-      putText(frame, text, Point(x1.toInt, y1.toInt), font, fontScale, fontColor, thickness, LINE_AA, false)
+      putText(
+        frame, 
+        text, 
+        Point(x1.toInt, y1.toInt), 
+        font, 
+        fontScale, 
+        fontColor, 
+        thickness, 
+        LINE_AA, 
+        false
+      )
 @main 
 def main =     
   val start = System.currentTimeMillis
